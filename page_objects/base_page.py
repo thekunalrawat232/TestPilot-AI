@@ -27,10 +27,12 @@ class PlaywrightBasePage:
     - Smart retry for flaky element interactions
     """
 
-    BASE_URL: str = os.getenv("BASE_URL", "http://localhost:3000")
+    BASE_URL: str = os.getenv("TARGET_BASE_URL", os.getenv("BASE_URL", "http://localhost:3000")).rstrip("/")
 
-    def __init__(self, page: "PWPage") -> None:
+    def __init__(self, page: "PWPage", base_url: str | None = None) -> None:
         self.page = page
+        if base_url:
+            self.BASE_URL = base_url
         self.page.set_default_timeout(30_000)
         self.page.set_default_navigation_timeout(15_000)
 
@@ -65,6 +67,16 @@ class PlaywrightBasePage:
     def select_option(self, selector: str, value: str) -> None:
         self.page.locator(selector).select_option(value)
 
+    def expect_element_to_be_visible(self, selector: str, timeout: int = 10_000) -> None:
+        self.page.locator(selector).wait_for(state="visible", timeout=timeout)
+
+    def click_element(self, selector: str) -> None:
+        self.page.locator(selector).click()
+
+    def fill_input(self, selector: str, value: str) -> None:
+        locator = self.page.locator(selector)
+        locator.fill(value)
+
     def screenshot(self, name: str = "screenshot") -> bytes:
         return self.page.screenshot(full_page=True)
 
@@ -82,10 +94,12 @@ class SeleniumBasePage:
     - Auto-scrolling before interactions
     """
 
-    BASE_URL: str = os.getenv("BASE_URL", "http://localhost:3000")
+    BASE_URL: str = os.getenv("TARGET_BASE_URL", os.getenv("BASE_URL", "http://localhost:3000")).rstrip("/")
 
-    def __init__(self, driver: "WebDriver") -> None:
+    def __init__(self, driver: "WebDriver", base_url: str | None = None) -> None:
         self.driver = driver
+        if base_url:
+            self.BASE_URL = base_url
         self.driver.implicitly_wait(0)  # We use explicit waits only
 
     # -- Navigation ----------------------------------------------------------
@@ -132,6 +146,19 @@ class SeleniumBasePage:
             return True
         except Exception:
             return False
+
+    def expect_element_to_be_visible(self, by: str, value: str, timeout: int = 10) -> None:
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        WebDriverWait(self.driver, timeout).until(
+            EC.visibility_of_element_located((by, value))
+        )
+
+    def click_element(self, by: str, value: str) -> None:
+        self.click(by, value)
+
+    def fill_input(self, by: str, value: str, text: str) -> None:
+        self.fill(by, value, text)
 
     def screenshot(self, name: str = "screenshot") -> bool:
         return self.driver.save_screenshot(f"{name}.png")

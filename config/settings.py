@@ -27,6 +27,22 @@ class LLMConfig:
     temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 
 
+def _parse_external_dirs() -> tuple[str, ...]:
+    """Read EXTERNAL_CONTEXT_DIRS env var into a tuple of paths.
+
+    Accepts multiple directories separated by the OS path separator (':' on
+    Linux/macOS, ';' on Windows) or by commas. These directories are ingested
+    into the RAG knowledge base read-only — nothing in them is ever modified.
+    """
+    raw = os.getenv("EXTERNAL_CONTEXT_DIRS", "")
+    parts: list[str] = []
+    for chunk in raw.replace(os.pathsep, ",").split(","):
+        cleaned = chunk.strip()
+        if cleaned:
+            parts.append(cleaned)
+    return tuple(parts)
+
+
 @dataclass(frozen=True)
 class RAGConfig:
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -35,6 +51,9 @@ class RAGConfig:
     chunk_size: int = 1500
     chunk_overlap: int = 200
     retrieval_k: int = 8
+    # Extra (external) project folders to ingest read-only, e.g. another repo's
+    # locators / page objects. Configured via EXTERNAL_CONTEXT_DIRS in .env.
+    external_context_dirs: tuple[str, ...] = field(default_factory=_parse_external_dirs)
 
 
 @dataclass(frozen=True)

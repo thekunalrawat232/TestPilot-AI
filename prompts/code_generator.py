@@ -43,6 +43,14 @@ Return a JSON object with exactly these keys:
 
 ## Mandatory Coding Standards
 
+### Use the Provided Project Context (IMPORTANT)
+- The user message includes a "Project Context" section with REAL locators, page
+  objects, and existing tests retrieved from the project's knowledge base.
+- When that context contains a selector/locator for an element you need, REUSE it
+  verbatim instead of inventing one. Prefer the real locators over guesses.
+- Match the existing project's page-object structure and naming conventions where shown.
+- Only invent a selector when the context has nothing relevant for that element.
+
 ### Page Object Model
 - Every page or component gets its own class inheriting from the provided base pages
   (``PlaywrightBasePage`` or ``SeleniumBasePage``).

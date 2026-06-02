@@ -34,16 +34,18 @@ def _write_generated_files(code_output: dict[str, Any]) -> list[str]:
     po_dir.mkdir(exist_ok=True)
     # Ensure page_objects is a package
     (po_dir / "__init__.py").write_text("")
-    # Copy base_page.py from project root so imports resolve correctly
+
+    for po in code_output.get("page_objects", []):
+        fpath = po_dir / Path(po["file_name"]).name
+        fpath.write_text(po["code"])
+        written.append(str(fpath))
+
+    # Copy base_page.py from project root AFTER LLM files so it always wins
     project_root = Path(__file__).parent.parent
     src_base = project_root / "page_objects" / "base_page.py"
     if src_base.exists():
         shutil.copy2(src_base, po_dir / "base_page.py")
-
-    for po in code_output.get("page_objects", []):
-        fpath = po_dir / po["file_name"]
-        fpath.write_text(po["code"])
-        written.append(str(fpath))
+        written.append(str(po_dir / "base_page.py"))
 
     # Playwright test files
     for tf in code_output.get("playwright_tests", []):
@@ -80,8 +82,22 @@ def code_generator_node(state: PipelineState) -> dict[str, Any]:
     llm = get_llm()
 
     test_plan_json = json.dumps(state.test_plan, indent=2)
+    test_plan_part = f"## Test Plan\n```json\n{test_plan_json}\n```"
 
-    user_content = f"## Test Plan\n```json\n{test_plan_json}\n```"
+    # Feed the retrieved project context (real locators / page objects / existing
+    # tests from the RAG knowledge base) to the code generator so generated
+    # scripts reuse actual selectors instead of guessing. Trim to fit the window.
+    context = trim_context_to_fit(
+        system_prompt=CODE_GENERATOR_PROMPT,
+        user_content_parts=[test_plan_part],
+        context=state.retrieved_context or "",
+    )
+
+    user_content = (
+        f"{test_plan_part}\n\n"
+        f"## Project Context (real locators / page objects / existing tests — reuse these)\n"
+        f"{context}"
+    )
 
     messages = [
         SystemMessage(content=CODE_GENERATOR_PROMPT),
