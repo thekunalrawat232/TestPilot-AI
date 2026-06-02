@@ -5,3 +5,4 @@ __pycache__/
 rag_store/
 generated/
 *.log
+.llm_cache/

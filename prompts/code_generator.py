@@ -91,6 +91,8 @@ from selenium.webdriver.support import expected_conditions as EC
 - Import paths assume the generated scripts directory as the working directory.
 - The base page classes are importable from ``page_objects.base_page``.
 - Strictly valid JSON output. No markdown fences or commentary outside the JSON.
+- CRITICAL: All Python docstrings inside JSON string values MUST use single quotes
+  ('''..''') NOT triple double-quotes (\"\"\"...\"\"\"). Triple double-quotes break JSON parsing.
 - NEVER hardcode URLs. Always read the base URL from the environment:
   ``BASE_URL = os.environ.get('BASE_URL', '')``
   Import ``os`` at the top of every test file.

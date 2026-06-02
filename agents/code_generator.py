@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from config.settings import get_llm, paths
 from prompts.code_generator import CODE_GENERATOR_PROMPT
 from .state import PipelineState
 from .utils import extract_json, trim_context_to_fit
+from .llm_cache import cached_llm_invoke
 
 
 def _write_generated_files(code_output: dict[str, Any]) -> list[str]:
@@ -23,11 +25,20 @@ def _write_generated_files(code_output: dict[str, Any]) -> list[str]:
     scripts_dir = paths.generated_scripts
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
+    # Remove stale test files from previous runs before writing new ones
+    for stale in scripts_dir.glob("test_*.py"):
+        stale.unlink()
+
     # Page objects
     po_dir = scripts_dir / "page_objects"
     po_dir.mkdir(exist_ok=True)
     # Ensure page_objects is a package
     (po_dir / "__init__.py").write_text("")
+    # Copy base_page.py from project root so imports resolve correctly
+    project_root = Path(__file__).parent.parent
+    src_base = project_root / "page_objects" / "base_page.py"
+    if src_base.exists():
+        shutil.copy2(src_base, po_dir / "base_page.py")
 
     for po in code_output.get("page_objects", []):
         fpath = po_dir / po["file_name"]
@@ -77,7 +88,7 @@ def code_generator_node(state: PipelineState) -> dict[str, Any]:
         HumanMessage(content=user_content),
     ]
 
-    response = llm.invoke(messages)
+    response = cached_llm_invoke(llm, messages, node_name="code_generator")
 
     try:
         code_output = extract_json(response.content)

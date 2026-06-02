@@ -44,3 +44,4 @@ def run_shell_command(command: str, timeout_seconds: int = 60) -> dict[str, Any]
         return {"success": False, "error": f"Command timed out after {timeout_seconds}s"}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
+                

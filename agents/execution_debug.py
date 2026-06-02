@@ -14,6 +14,7 @@ from config.settings import get_llm, exec_config, paths
 from prompts.execution_debug import EXECUTION_DEBUG_PROMPT
 from .state import PipelineState
 from .utils import extract_json, trim_context_to_fit
+from .llm_cache import cached_llm_invoke
 
 
 def _run_tests(scripts_dir: Path) -> dict[str, str]:
@@ -26,18 +27,20 @@ def _run_tests(scripts_dir: Path) -> dict[str, str]:
 
     for test_file in test_files:
         cmd = [
-            "python", "-m", "pytest",
+            "python3", "-m", "pytest",
             str(test_file),
             "--tb=short",
             "-v",
             "--timeout=60",
         ]
 
+        project_root = Path(__file__).parent.parent
+        pythonpath = f"{scripts_dir}{os.pathsep}{project_root}"
         env = {
             **os.environ,
             "BASE_URL": exec_config.target_base_url,
             "HEADLESS": str(exec_config.headless).lower(),
-            "PYTHONPATH": str(scripts_dir),
+            "PYTHONPATH": pythonpath,
         }
 
         try:
@@ -108,7 +111,9 @@ def execution_node(state: PipelineState) -> dict[str, Any]:
             "failed_files": failed_files,
             "all_passed": len(failed_files) == 0,
         },
-        "pipeline_status": "passed" if len(failed_files) == 0 else "running",
+        "pipeline_status": "passed" if len(failed_files) == 0 else (
+            "failed" if state.retry_count >= state.max_retries else "running"
+        ),
     }
 
 
@@ -167,7 +172,7 @@ def debug_node(state: PipelineState) -> dict[str, Any]:
         )),
     ]
 
-    response = llm.invoke(messages)
+    response = cached_llm_invoke(llm, messages, node_name="debug")
 
     try:
         analysis = extract_json(response.content)

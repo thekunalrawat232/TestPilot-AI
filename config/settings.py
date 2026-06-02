@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# Module-level tracker for Google RPM pacing (5 RPM = 1 call per 12s)
+_last_google_call_time: float = 0.0
+_GOOGLE_MIN_INTERVAL: float = 13.0  # 12s + 1s buffer
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -75,6 +79,7 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "claude-sonnet-4-5-20241022": 200_000,
     "claude-haiku-4-5-20251001": 200_000,
     # Google Gemini
+    "gemini-2.5-flash": 1_048_576,
     "gemini-2.0-flash": 1_048_576,
     "gemini-1.5-flash": 1_048_576,
     "gemini-1.5-pro": 2_097_152,
@@ -156,7 +161,42 @@ def get_llm():
 
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
+        import re as _re
+
+        class _RetryGoogleLLM(ChatGoogleGenerativeAI):
+            def invoke(self, messages, *args, **kwargs):
+                global _last_google_call_time
+
+                # RPM pacing: enforce minimum interval between calls
+                elapsed = time.time() - _last_google_call_time
+                if _last_google_call_time > 0 and elapsed < _GOOGLE_MIN_INTERVAL:
+                    wait = _GOOGLE_MIN_INTERVAL - elapsed
+                    print(f"\n⏳ RPM pacing — waiting {wait:.1f}s (5 RPM limit)...")
+                    time.sleep(wait)
+
+                for attempt in range(1, 5):
+                    try:
+                        _last_google_call_time = time.time()
+                        return super().invoke(messages, *args, **kwargs)
+                    except Exception as e:
+                        err = str(e)
+                        if "503" in err or "UNAVAILABLE" in err:
+                            wait = 15 * attempt
+                            print(f"\n⏳ Gemini 503 — waiting {wait}s before retry (attempt {attempt}/4)...")
+                            time.sleep(wait)
+                            if attempt == 4:
+                                raise
+                        elif "429" in err or "RESOURCE_EXHAUSTED" in err:
+                            m = _re.search(r'retryDelay.*?(\d+)s', err)
+                            wait = int(m.group(1)) + 5 if m else 65
+                            print(f"\n⏳ Gemini 429 — waiting {wait}s before retry (attempt {attempt}/4)...")
+                            time.sleep(wait)
+                            if attempt == 4:
+                                raise
+                        else:
+                            raise
+
+        return _RetryGoogleLLM(
             model=llm_config.model,
             temperature=llm_config.temperature,
             max_retries=2,

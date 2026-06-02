@@ -114,8 +114,36 @@ def trim_context_to_fit(
     return truncated + "\n\n... [context truncated to fit context window]"
 
 
+def _sanitize_llm_json(text: str) -> str:
+    """Fix common LLM JSON generation mistakes before parsing.
+
+    Handles:
+    - Python triple-quoted docstrings: \"\"\"...\"\"\" → '''...'''
+    - JS string repeat expressions: \"x\".repeat(N) → \"xxx...\" (N chars)
+    - JS string constructor calls: String(x) left as-is (rare, skipped)
+    """
+    import re
+
+    # Replace Python triple-double-quote docstrings with single-quoted equivalents
+    # so they don't confuse the JSON string parser.
+    text = text.replace('"""', "'''")
+
+    # Replace "char".repeat(N) with an actual repeated string literal.
+    def _expand_repeat(m: re.Match) -> str:
+        char = m.group(1)   # the character inside quotes
+        count = int(m.group(2))
+        # Cap at a safe length to avoid giant strings in test data
+        return '"' + (char * min(count, 256)) + '"'
+
+    text = re.sub(r'"(.)"\s*\.\s*repeat\s*\(\s*(\d+)\s*\)', _expand_repeat, text)
+
+    return text
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Robustly extract JSON from LLM response that may contain markdown fences."""
+    import re
+
     text = text.strip()
     # Strip markdown code fences if present
     if text.startswith("```"):
@@ -123,4 +151,23 @@ def extract_json(text: str) -> dict[str, Any]:
         start = 1 if lines[0].startswith("```") else 0
         end = -1 if lines[-1].strip() == "```" else len(lines)
         text = "\n".join(lines[start:end]).strip()
-    return json.loads(text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Apply LLM-specific sanitisation and retry.
+    fixed = _sanitize_llm_json(text)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: extract the outermost {...} block and try again.
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        candidate = _sanitize_llm_json(match.group(0))
+        return json.loads(candidate)
+
+    raise json.JSONDecodeError("No valid JSON object found", text, 0)
