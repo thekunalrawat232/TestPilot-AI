@@ -6,3 +6,6 @@ rag_store/
 generated/
 *.log
 .llm_cache/
+CLAUDE.md
+.claude/
+locator_gap_forms.md
