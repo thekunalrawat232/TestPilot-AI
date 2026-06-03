@@ -32,12 +32,23 @@ _SKIP_DIRS = {
     "playwright-report", "allure-results",
 }
 
+# AI-agent / prose docs to skip. These are long natural-language instruction
+# files (not code/locators) that bloat the context and can derail the LLM into
+# returning non-JSON output. Matched case-insensitively by exact file name.
+_SKIP_FILES = {
+    "agent_context.md", "claude.md", "agents.md", "readme.md",
+    "changelog.md", "contributing.md", "code_of_conduct.md", "license.md",
+}
+# Markdown files larger than this are treated as prose and skipped too.
+_MD_MAX_BYTES = 40_000
+
 
 def _collect_files(directory: Path) -> list[Path]:
     """Recursively collect indexable files from a directory.
 
-    Skips dependency/cache/artifact directories (see ``_SKIP_DIRS``) so that
-    ingesting a real project doesn't pull in node_modules or test reports.
+    Skips dependency/cache/artifact directories (see ``_SKIP_DIRS``) and bulky
+    AI-agent / prose docs (see ``_SKIP_FILES``) so ingesting a real project
+    pulls in code & locators, not node_modules, reports, or instruction prose.
     """
     if not directory.exists():
         return []
@@ -49,8 +60,14 @@ def _collect_files(directory: Path) -> list[Path]:
             continue
         if any(part in _SKIP_DIRS for part in f.parts):
             continue
+        if f.name.lower() in _SKIP_FILES:
+            continue
         try:
-            if f.stat().st_size >= 500_000:
+            size = f.stat().st_size
+            if size >= 500_000:
+                continue
+            # Skip large markdown — it's prose, not code/locators.
+            if f.suffix.lower() == ".md" and size > _MD_MAX_BYTES:
                 continue
         except OSError:
             continue

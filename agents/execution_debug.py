@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -17,13 +20,63 @@ from .utils import extract_json, trim_context_to_fit
 from .llm_cache import cached_llm_invoke
 
 
-def _run_tests(scripts_dir: Path) -> dict[str, str]:
-    """Execute all test files in the scripts directory and collect outputs."""
-    results: dict[str, str] = {}
+def _sanitize_generated_code(scripts_dir: Path) -> list[str]:
+    """Cheap, deterministic guards against collection-killing codegen bugs.
+
+    Fixes (no API calls), applied before pytest collection:
+    1. Self-referential imports — a module importing a name from its OWN module
+       path (e.g. ``form_page.py`` doing ``from page_objects.form_page import X``).
+       Always a circular import; the line is removed.
+    2. Broken multi-line ``assert`` — ``assert cond,\n    msg`` is a SyntaxError
+       in Python; the message is pulled back onto the assert line.
+    """
+    import re as _re
+
+    fixed: list[str] = []
+    py_files = list(scripts_dir.glob("*.py")) + list((scripts_dir / "page_objects").glob("*.py"))
+
+    # assert <cond>,  <newline>  <indented msg>   →   assert <cond>, <msg>
+    assert_break = _re.compile(r"(^[ \t]*assert\b[^\n]*,)[ \t]*\n[ \t]+(?=\S)", _re.MULTILINE)
+
+    for f in py_files:
+        try:
+            text = f.read_text()
+        except Exception:
+            continue
+        mod = f.stem  # e.g. "form_page"
+        # Self-import: from form_page import X | from page_objects.form_page import X
+        #              from .form_page import X | import form_page
+        self_import = _re.compile(
+            rf"^[ \t]*(?:from\s+(?:[\w.]*\.)?{_re.escape(mod)}\s+import\s+.*|import\s+{_re.escape(mod)})\s*$",
+            _re.MULTILINE,
+        )
+
+        new_text = self_import.sub("", text)
+        # Join broken asserts (run twice in case of stacked continuations).
+        for _ in range(2):
+            new_text = assert_break.sub(r"\1 ", new_text)
+
+        if new_text != text:
+            f.write_text(new_text)
+            fixed.append(f.name)
+    return fixed
+
+
+def _run_tests(scripts_dir: Path) -> dict[str, dict[str, Any]]:
+    """Execute all test files in the scripts directory and collect outputs.
+
+    Returns a dict keyed by file name, each value ``{"output": str,
+    "returncode": int}``. The pytest exit code is authoritative for pass/fail
+    (0 = passed; non-zero = failure, including collection/import errors and
+    "no tests collected" which is code 5). String-matching the output is
+    unreliable — e.g. an ``ImportError`` in conftest yields no "FAILED"/"ERROR"
+    token yet means nothing ran.
+    """
+    results: dict[str, dict[str, Any]] = {}
 
     test_files = sorted(scripts_dir.glob("test_*.py"))
     if not test_files:
-        return {"_no_tests": "No test files found in generated scripts directory."}
+        return {"_no_tests": {"output": "No test files found in generated scripts directory.", "returncode": 5}}
 
     for test_file in test_files:
         cmd = [
@@ -48,35 +101,49 @@ def _run_tests(scripts_dir: Path) -> dict[str, str]:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=900,
                 env=env,
                 cwd=str(scripts_dir),
             )
             output = proc.stdout + "\n" + proc.stderr
-            results[test_file.name] = output[-6000:]
+            results[test_file.name] = {"output": output[-6000:], "returncode": proc.returncode}
         except subprocess.TimeoutExpired:
-            results[test_file.name] = "TIMEOUT: Test execution exceeded 180 seconds."
+            results[test_file.name] = {"output": "TIMEOUT: Test execution exceeded 900 seconds.", "returncode": 124}
         except Exception as exc:
-            results[test_file.name] = f"EXECUTION ERROR: {exc}"
+            results[test_file.name] = {"output": f"EXECUTION ERROR: {exc}", "returncode": 1}
 
     return results
 
 
 def _apply_fixes(fixed_files: list[dict[str, str]], scripts_dir: Path) -> list[str]:
-    """Write corrected files back to disk."""
+    """Write corrected files back to disk.
+
+    A fix is only applied if it parses as valid Python. The debug LLM sometimes
+    returns truncated/garbled code; writing that would CLOBBER a working file and
+    break collection. Invalid fixes are skipped so good code is never overwritten.
+    """
+    import ast as _ast
+
     written: list[str] = []
     for fix in fixed_files:
         fname = fix.get("file_name", "")
         code = fix.get("code", "")
-        if fname and code:
-            # Handle page objects subdirectory
-            if fname.endswith("_page.py"):
-                fpath = scripts_dir / "page_objects" / fname
-            else:
-                fpath = scripts_dir / fname
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(code)
-            written.append(str(fpath))
+        if not (fname and code):
+            continue
+        if fname.endswith(".py"):
+            try:
+                _ast.parse(code)
+            except SyntaxError:
+                logger.warning("Skipping debug fix for %s — proposed code is not valid Python.", fname)
+                continue
+        # Handle page objects subdirectory
+        if fname.endswith("_page.py"):
+            fpath = scripts_dir / "page_objects" / fname
+        else:
+            fpath = scripts_dir / fname
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(code)
+        written.append(str(fpath))
     return written
 
 
@@ -95,23 +162,31 @@ def execution_node(state: PipelineState) -> dict[str, Any]:
     """
     scripts_dir = paths.generated_scripts
 
-    raw_results = _run_tests(scripts_dir)
+    # Deterministic pre-flight fix for common collection-killing codegen bugs.
+    _sanitize_generated_code(scripts_dir)
 
-    # Build a summary
-    total_files = len(raw_results)
-    failed_files = [
-        fname for fname, output in raw_results.items()
-        if "FAILED" in output or "ERROR" in output or "TIMEOUT" in output
-    ]
+    run_results = _run_tests(scripts_dir)
+
+    # pytest exit code is authoritative: 0 = passed, anything else = failure
+    # (1 failed, 2 interrupted, 3 internal, 4 usage, 5 no tests collected).
+    raw_outputs = {fname: r["output"] for fname, r in run_results.items()}
+    failed_files = [fname for fname, r in run_results.items() if r.get("returncode", 1) != 0]
+
+    # A run with no collectable tests (e.g. conftest import error → code 5, or the
+    # "_no_tests" sentinel) is NOT a pass.
+    ran_something = bool(run_results) and "_no_tests" not in run_results
+    all_passed = ran_something and len(failed_files) == 0
+
+    total_files = len(run_results)
 
     return {
         "execution_result": {
-            "raw_outputs": raw_results,
+            "raw_outputs": raw_outputs,
             "total_files": total_files,
             "failed_files": failed_files,
-            "all_passed": len(failed_files) == 0,
+            "all_passed": all_passed,
         },
-        "pipeline_status": "passed" if len(failed_files) == 0 else (
+        "pipeline_status": "passed" if all_passed else (
             "failed" if state.retry_count >= state.max_retries else "running"
         ),
     }

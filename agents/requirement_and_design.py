@@ -44,16 +44,32 @@ def requirement_and_design_node(state: PipelineState) -> dict[str, Any]:
 
     response = cached_llm_invoke(llm, messages, node_name="requirement_and_design")
 
+    combined = None
     try:
         combined = extract_json(response.content)
-    except (json.JSONDecodeError, Exception) as exc:
-        return {
-            "requirement_analysis": {"raw_response": response.content},
-            "test_plan": {},
-            "retrieved_context": context,
-            "error_log": [f"RequirementAndDesign JSON parse error: {exc}"],
-            "pipeline_status": "running",
-        }
+    except (json.JSONDecodeError, Exception):
+        # The model occasionally returns prose, a truncated runaway, or otherwise
+        # non-JSON output. Retry ONCE with a strict reminder before giving up —
+        # otherwise the empty plan makes the code generator improvise off-scope.
+        retry_messages = messages + [
+            HumanMessage(content=(
+                "Your previous response could not be parsed as JSON. Respond AGAIN with "
+                "ONLY the single JSON object specified in the system prompt: no prose, no "
+                "markdown fences, no code copied from the context, every string value short "
+                "and single-line. Output must start with '{' and end with '}'."
+            )),
+        ]
+        try:
+            response = cached_llm_invoke(llm, retry_messages, node_name="requirement_and_design_retry")
+            combined = extract_json(response.content)
+        except (json.JSONDecodeError, Exception) as exc:
+            return {
+                "requirement_analysis": {"raw_response": response.content},
+                "test_plan": {},
+                "retrieved_context": context,
+                "error_log": [f"RequirementAndDesign JSON parse error (after retry): {exc}"],
+                "pipeline_status": "running",
+            }
 
     return {
         "requirement_analysis": combined.get("requirement_analysis", {}),

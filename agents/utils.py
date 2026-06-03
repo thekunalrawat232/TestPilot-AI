@@ -13,8 +13,8 @@ from config.settings import llm_config, get_context_limit
 
 logger = logging.getLogger(__name__)
 
-# Tiktoken encoding — cl100k_base works for GPT-4o and is a reasonable
-# approximation for Anthropic models too.
+# Tiktoken encoding — cl100k_base is a reasonable token-count approximation
+# for Gemini (which has no public tiktoken encoding).
 _ENCODING: tiktoken.Encoding | None = None
 
 
@@ -118,15 +118,36 @@ def _sanitize_llm_json(text: str) -> str:
     """Fix common LLM JSON generation mistakes before parsing.
 
     Handles:
-    - Python triple-quoted docstrings: \"\"\"...\"\"\" → '''...'''
-    - JS string repeat expressions: \"x\".repeat(N) → \"xxx...\" (N chars)
-    - JS string constructor calls: String(x) left as-is (rare, skipped)
+    - Triple-quoted VALUES: ``"code": '''...'''`` or ``"code": \"\"\"...\"\"\"``.
+      LLMs frequently delimit big code blobs with triple quotes (which are NOT
+      valid JSON), and the code itself often contains ''' Python docstrings.
+      We rewrite each triple-quoted value into a properly escaped JSON string.
+    - JS string repeat expressions: ``"x".repeat(N)`` → ``"xxx..."`` (N chars)
     """
     import re
 
-    # Replace Python triple-double-quote docstrings with single-quoted equivalents
-    # so they don't confuse the JSON string parser.
-    text = text.replace('"""', "'''")
+    # Convert triple-quoted values to valid JSON strings. Restrict to the known
+    # multi-line fields ("code", "requirements_txt") so a ``: '''`` that appears
+    # INSIDE the embedded Python (dict literals, etc.) is never mistaken for a
+    # JSON value boundary — matching those mangles the whole structure.
+    # The closing delimiter is the triple-quote followed by JSON punctuation
+    # (, } ]), so nested Python docstrings (followed by code, not punctuation) are
+    # correctly skipped by the non-greedy match + trailing anchor.
+    triple_value = re.compile(
+        r'("(?:code|requirements_txt)"\s*:\s*)("""|\'\'\')(.*?)\2(\s*[,}\]])',
+        re.DOTALL,
+    )
+
+    def _to_json_string(m: re.Match) -> str:
+        body = m.group(3)
+        return m.group(1) + json.dumps(body) + m.group(4)
+
+    # Run a few passes in case of adjacent values the first pass consumed around.
+    for _ in range(3):
+        new_text = triple_value.sub(_to_json_string, text)
+        if new_text == text:
+            break
+        text = new_text
 
     # Replace "char".repeat(N) with an actual repeated string literal.
     def _expand_repeat(m: re.Match) -> str:
@@ -152,15 +173,18 @@ def extract_json(text: str) -> dict[str, Any]:
         end = -1 if lines[-1].strip() == "```" else len(lines)
         text = "\n".join(lines[start:end]).strip()
 
+    # strict=False tolerates literal control characters (newlines/tabs) inside
+    # string values — a very common LLM mistake in large multi-line responses
+    # that otherwise raises "Invalid control character".
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError:
         pass
 
     # Apply LLM-specific sanitisation and retry.
     fixed = _sanitize_llm_json(text)
     try:
-        return json.loads(fixed)
+        return json.loads(fixed, strict=False)
     except json.JSONDecodeError:
         pass
 
@@ -168,6 +192,6 @@ def extract_json(text: str) -> dict[str, Any]:
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         candidate = _sanitize_llm_json(match.group(0))
-        return json.loads(candidate)
+        return json.loads(candidate, strict=False)
 
     raise json.JSONDecodeError("No valid JSON object found", text, 0)

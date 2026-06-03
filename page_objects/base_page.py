@@ -29,12 +29,19 @@ class PlaywrightBasePage:
 
     BASE_URL: str = os.getenv("TARGET_BASE_URL", os.getenv("BASE_URL", "http://localhost:3000")).rstrip("/")
 
+    # Default per-action / navigation timeouts (ms). Exposed as instance
+    # attributes so page objects can reference ``self.timeout`` directly.
+    timeout: int = 30_000
+    navigation_timeout: int = 30_000
+
     def __init__(self, page: "PWPage", base_url: str | None = None) -> None:
         self.page = page
         if base_url:
             self.BASE_URL = base_url
-        self.page.set_default_timeout(30_000)
-        self.page.set_default_navigation_timeout(15_000)
+        self.timeout = 30_000
+        self.navigation_timeout = 30_000
+        self.page.set_default_timeout(self.timeout)
+        self.page.set_default_navigation_timeout(self.navigation_timeout)
 
     # -- Navigation ----------------------------------------------------------
 
@@ -42,7 +49,47 @@ class PlaywrightBasePage:
         url = f"{self.BASE_URL}{path}"
         self.page.goto(url, wait_until="domcontentloaded")
 
+    def navigate_sidebar(self, item_text: str, path: str | None = None) -> None:
+        """Navigate to a section via the left sidebar.
+
+        Tries clicking the sidebar entry whose visible text matches
+        ``item_text``; if no such entry is found, falls back to navigating
+        directly to ``path`` (reliable once authenticated). Generated page
+        objects call this, so it must exist on the base class.
+        """
+        candidates = (
+            f"a:has-text('{item_text}')",
+            f"[role='tab']:has-text('{item_text}')",
+            f"span:text-is('{item_text}')",
+            f"li:has-text('{item_text}')",
+            f"nav >> text={item_text}",
+        )
+        for sel in candidates:
+            try:
+                loc = self.page.locator(sel).first
+                if loc.count() > 0:
+                    loc.click(timeout=5_000)
+                    self.page.wait_for_load_state("networkidle")
+                    return
+            except Exception:
+                continue
+        if path:
+            self.navigate(path)
+            try:
+                self.page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
     # -- Element helpers (no hard waits) ------------------------------------
+
+    def fill_by_label(self, label: str, value: str) -> None:
+        """Fill the input associated with a visible ``<label>`` text.
+
+        Use this for fields identified by their label (e.g. "Email Address")
+        instead of ``locator("label:has-text(...)")``, which targets the label
+        element itself (not fillable).
+        """
+        self.page.get_by_label(label).fill(value)
 
     def click(self, selector: str) -> None:
         self.page.locator(selector).click()
