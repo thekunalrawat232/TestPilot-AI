@@ -85,6 +85,9 @@ def _run_tests(scripts_dir: Path) -> dict[str, dict[str, Any]]:
             "--tb=short",
             "-v",
             "--timeout=60",
+            # pytest-playwright base URL so any relative page.goto("/path")
+            # resolves against the target app instead of erroring "invalid URL".
+            f"--base-url={exec_config.target_base_url}",
         ]
 
         project_root = Path(__file__).parent.parent
