@@ -1,79 +1,88 @@
-"""Node 1 — Combined Requirement Analyst + Test Designer (single LLM call)."""
+"""Node 1 — Planner. Requirement -> small STRUCTURED test plan (1 LLM call).
+
+The model never writes code. It picks locator NAMES from the real catalog and
+emits a plan of steps from a fixed action vocabulary. A deterministic renderer
+(agents/render.py) turns the plan into runnable Playwright tests.
+"""
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from config.settings import get_llm
 from prompts.requirement_and_design import REQUIREMENT_AND_DESIGN_PROMPT
-from rag import ProjectRetriever
+from .render import extract_locator_catalog, format_locator_catalog
 from .state import PipelineState
-from .utils import extract_json, trim_context_to_fit
+from .utils import extract_json
 from .llm_cache import cached_llm_invoke
 
 
+def _fallback_plan(requirement: str, catalog: dict[str, dict]) -> dict[str, Any]:
+    """A deterministic minimal plan so the pipeline NEVER crashes on a bad LLM
+    response: navigate to the likely page and assert a heading-ish locator."""
+    req = requirement.lower()
+    path = "/forms" if "form" in req else "/"
+    heading = None
+    for info in catalog.values():
+        for name in info["selectors"]:
+            if "HEADING" in name or "TITLE" in name or "PAGE" in name:
+                heading = name
+                break
+        if heading:
+            break
+    steps: list[dict] = [{"action": "goto", "target": path}]
+    if heading:
+        steps.append({"action": "expect_visible", "target": heading})
+    return {
+        "feature_name": "fallback_plan",
+        "summary": "Fallback plan (LLM plan unavailable).",
+        "tests": [{"id": "TC_001", "title": "Page loads", "steps": steps}],
+    }
+
+
 def requirement_and_design_node(state: PipelineState) -> dict[str, Any]:
-    """Analyse the requirement AND design the test plan in a single LLM call.
-
-    Replaces the two separate requirement_analyst + test_designer nodes,
-    cutting LLM calls from 3 to 2 per pipeline run.
-    """
-    retriever = ProjectRetriever()
-
-    context = retriever.query_formatted(state.raw_requirement, k=10)
+    """Produce a structured test plan from the requirement (single LLM call)."""
+    catalog = extract_locator_catalog("", state.raw_requirement)
+    catalog_str = format_locator_catalog(catalog)
 
     llm = get_llm()
-
-    requirement_text = f"## Feature Requirement\n{state.raw_requirement}"
-    context = trim_context_to_fit(
-        system_prompt=REQUIREMENT_AND_DESIGN_PROMPT,
-        user_content_parts=[requirement_text],
-        context=context,
+    user = (
+        f"## Feature Requirement\n{state.raw_requirement}\n\n"
+        f"## LOCATOR CATALOG (reference these NAMES only)\n{catalog_str}"
     )
-
     messages = [
         SystemMessage(content=REQUIREMENT_AND_DESIGN_PROMPT),
-        HumanMessage(content=(
-            f"{requirement_text}\n\n"
-            f"## Project Context (from knowledge base)\n{context}"
-        )),
+        HumanMessage(content=user),
     ]
 
-    response = cached_llm_invoke(llm, messages, node_name="requirement_and_design")
-
-    combined = None
+    plan: dict[str, Any] | None = None
+    err: str | None = None
     try:
-        combined = extract_json(response.content)
-    except (json.JSONDecodeError, Exception):
-        # The model occasionally returns prose, a truncated runaway, or otherwise
-        # non-JSON output. Retry ONCE with a strict reminder before giving up —
-        # otherwise the empty plan makes the code generator improvise off-scope.
-        retry_messages = messages + [
-            HumanMessage(content=(
-                "Your previous response could not be parsed as JSON. Respond AGAIN with "
-                "ONLY the single JSON object specified in the system prompt: no prose, no "
-                "markdown fences, no code copied from the context, every string value short "
-                "and single-line. Output must start with '{' and end with '}'."
-            )),
-        ]
+        plan = extract_json(cached_llm_invoke(llm, messages, node_name="planner").content)
+    except Exception:
+        # One strict retry, then a deterministic fallback — never crash.
+        retry = messages + [HumanMessage(content=(
+            "Your previous response was not valid JSON. Return ONLY the JSON plan object "
+            "per the schema — no prose, no fences. Start with '{' and end with '}'."
+        ))]
         try:
-            response = cached_llm_invoke(llm, retry_messages, node_name="requirement_and_design_retry")
-            combined = extract_json(response.content)
-        except (json.JSONDecodeError, Exception) as exc:
-            return {
-                "requirement_analysis": {"raw_response": response.content},
-                "test_plan": {},
-                "retrieved_context": context,
-                "error_log": [f"RequirementAndDesign JSON parse error (after retry): {exc}"],
-                "pipeline_status": "running",
-            }
+            plan = extract_json(cached_llm_invoke(llm, retry, node_name="planner_retry").content)
+        except Exception as exc:
+            err = f"Planner JSON parse error (after retry): {exc}"
+
+    if not isinstance(plan, dict) or not plan.get("tests"):
+        plan = _fallback_plan(state.raw_requirement, catalog)
+        err = err or "Planner returned no usable tests; used fallback plan."
 
     return {
-        "requirement_analysis": combined.get("requirement_analysis", {}),
-        "test_plan": combined.get("test_plan", {}),
-        "retrieved_context": context,
+        "requirement_analysis": {
+            "feature_name": plan.get("feature_name", ""),
+            "summary": plan.get("summary", ""),
+        },
+        "test_plan": plan,
+        "retrieved_context": catalog_str,
+        "error_log": [err] if err else [],
         "pipeline_status": "running",
     }

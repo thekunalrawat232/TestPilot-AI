@@ -47,10 +47,20 @@ def _get_list_id(board_id: str) -> str:
     )
 
 
-def _get_existing_card_names(list_id: str) -> set:
+def _get_existing_cards(list_id: str) -> dict:
+    """Return {card_name_lower: card_id} for cards already on the list."""
     resp = requests.get(f"{BASE_URL}/lists/{list_id}/cards", params={**AUTH, "fields": "name"})
     resp.raise_for_status()
-    return {card["name"].strip().lower() for card in resp.json()}
+    return {card["name"].strip().lower(): card["id"] for card in resp.json()}
+
+
+def _update_card(card_id: str, desc: str, label_id: str | None) -> dict:
+    params = {**AUTH, "desc": desc}
+    if label_id:
+        params["idLabels"] = label_id
+    resp = requests.put(f"{BASE_URL}/cards/{card_id}", params=params)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _get_or_create_label(board_id: str, severity: str) -> str | None:
@@ -108,7 +118,7 @@ def push_bugs_to_trello(bug_reports: list[dict], feature_name: str = "unknown") 
     try:
         board_id = _get_board_id()
         list_id = _get_list_id(board_id)
-        existing = _get_existing_card_names(list_id)
+        existing = _get_existing_cards(list_id)
     except Exception as e:
         print(f"[trello] Setup failed: {e}")
         return []
@@ -120,21 +130,22 @@ def push_bugs_to_trello(bug_reports: list[dict], feature_name: str = "unknown") 
             continue
 
         card_name = f"[{bug.get('severity', 'bug').upper()}] {title}"
-
-        if card_name.lower() in existing:
-            print(f"[trello] Duplicate skipped: {card_name[:70]}")
-            continue
-
         desc = _format_description(bug, feature_name)
         label_id = _get_or_create_label(board_id, bug.get("severity", ""))
 
         try:
-            card = _create_card(list_id, card_name, desc, label_id)
-            created.append({"name": card_name, "url": card.get("shortUrl", "")})
-            existing.add(card_name.lower())
-            print(f"[trello] Card created: {card_name[:70]} → {card.get('shortUrl', '')}")
+            if card_name.lower() in existing:
+                # Refresh the existing card's description with the latest detail.
+                card = _update_card(existing[card_name.lower()], desc, label_id)
+                created.append({"name": card_name, "url": card.get("shortUrl", "")})
+                print(f"[trello] Card updated: {card_name[:70]} → {card.get('shortUrl', '')}")
+            else:
+                card = _create_card(list_id, card_name, desc, label_id)
+                created.append({"name": card_name, "url": card.get("shortUrl", "")})
+                existing[card_name.lower()] = card.get("id", "")
+                print(f"[trello] Card created: {card_name[:70]} → {card.get('shortUrl', '')}")
         except Exception as e:
-            print(f"[trello] Failed to create card '{card_name[:50]}': {e}")
+            print(f"[trello] Failed for card '{card_name[:50]}': {e}")
 
     print(f"[trello] Done — {len(created)} card(s) created.")
     return created

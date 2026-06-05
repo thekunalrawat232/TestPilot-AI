@@ -9,18 +9,34 @@ Built with **LangGraph**, **RAG (ChromaDB)**, and multi-provider LLM support.
 ## What It Does
 
 ```
-"As a user I can log in with email and password"
+"Go to the forms section and list out the bugs on the first page"
              ↓
-  Requirement & Test Design  (1 LLM call)
+  Planner          (1 Gemini call) → small structured JSON test plan
+             ↓                         (steps from a fixed vocabulary,
+             ↓                          referencing REAL locator names)
+  Render           (deterministic, NO LLM) → valid Playwright suite
+             ↓                                + fixed harness + real locators
+  Execution        (pytest; logs in ONCE, reuses session for all tests)
              ↓
-  Code Generation            (Playwright + Selenium scripts written to disk)
-             ↓
-  Execution                  (pytest runs against your live app)
-             ↓
-  Debug Loop                 (AI fixes test bugs, retries up to N times)
-             ↓
-  Trello Cards               (real bugs → cards with severity + steps to reproduce)
+  Finalise         (failing checks → findings → Trello cards + report)
 ```
+
+### Design: the model plans, the engine renders
+
+The earlier version asked the LLM to write all the test code — which a fast/free
+model does unreliably (escaping, imports, syntax). This version flips that:
+
+- **The LLM only produces a small structured plan** (its strength), referencing
+  locator NAMES from a real catalog. It never writes code.
+- **A deterministic renderer turns the plan into Playwright code** — every
+  referenced locator and action is validated, so the output is *always* valid
+  Python. Unknown locators/actions are skipped, never broken.
+- **A fixed, hand-written harness** handles the Auth0 login **once per run** and
+  reuses the session (`storage_state`) for every test — fast and reliable.
+
+Result: **one Gemini call per run** (~20 runs/day on the free tier) and code that
+can't break, because the model is no longer in the code path. The Debug agent was
+removed — there is nothing to auto-fix.
 
 ---
 
@@ -29,8 +45,10 @@ Built with **LangGraph**, **RAG (ChromaDB)**, and multi-provider LLM support.
 | Layer | Technology |
 |-------|-----------|
 | Agent orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) |
-| LLM providers | OpenAI / Anthropic / Google Gemini / Groq |
-| RAG / Vector store | [ChromaDB](https://www.trychroma.com/) + HuggingFace embeddings |
+| LLM provider | Google Gemini (gemini-2.5-flash) |
+| Locator source | Real external framework, ingested read-only (`EXTERNAL_CONTEXT_DIRS`) |
+| Browser automation | [Playwright](https://playwright.dev/python/) (session-scoped auth) |
+| Bug tracking | [Trello API](https://developer.atlassian.com/cloud/trello/) |
 | Browser automation | [Playwright](https://playwright.dev/python/) + [Selenium](https://selenium-python.readthedocs.io/) |
 | Bug tracking | [Trello API](https://developer.atlassian.com/cloud/trello/) |
 | LLM response caching | Disk-based MD5 cache (saves API quota) |

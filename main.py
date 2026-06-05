@@ -52,11 +52,10 @@ def _print_state_summary(state: dict) -> None:
         console.print(f"  Feature: [cyan]{ra['feature_name']}[/cyan]")
         console.print(f"  Summary: {ra.get('summary', 'N/A')}")
 
-    # Test plan summary
+    # Test plan summary (new schema: a flat list of tests)
     tp = state.get("test_plan", {})
-    suites = tp.get("test_suites", [])
-    total_tc = sum(len(s.get("test_cases", [])) for s in suites)
-    console.print(f"  Test suites: {len(suites)}, Total test cases: {total_tc}")
+    tests = tp.get("tests", [])
+    console.print(f"  Tests planned: {len(tests)}")
 
     # Generated files
     gc = state.get("generated_code", {})

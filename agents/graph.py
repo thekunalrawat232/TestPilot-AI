@@ -44,17 +44,19 @@ from config.settings import paths, exec_config
 from .state import PipelineState
 from .requirement_and_design import requirement_and_design_node
 from .code_generator import code_generator_node
-from .execution_debug import execution_node, debug_node, should_retry
+from .execution_debug import execution_node
 from .checkpoint import save_checkpoint, load_checkpoint
 from integrations.trello import push_bugs_to_trello
 
 logger = logging.getLogger(__name__)
 
+# Linear pipeline: plan (1 LLM call) -> render (deterministic) -> execute -> finalise.
+# The Debug agent was removed — the deterministic renderer never produces broken
+# code, so there is nothing to auto-fix, and dropping it keeps runs to 1 LLM call.
 NODE_ORDER = [
     "requirement_and_design",
     "code_generator",
     "execution",
-    "debug",
     "finalise",
 ]
 
@@ -101,12 +103,12 @@ def _write_live_status(run_id: str, node_name: str, event: str, state_dict: dict
     debug_analysis = state_dict.get("debug_analysis", {})
     generated_code = state_dict.get("generated_code", {})
 
-    test_suites = test_plan.get("test_suites", [])
-    test_cases_count = sum(len(s.get("test_cases", [])) for s in test_suites)
+    tests = test_plan.get("tests", [])
+    test_cases_count = len(tests)
 
     summary = {
         "feature_name": req_analysis.get("feature_name", ""),
-        "test_suites": len(test_suites),
+        "test_suites": 1 if tests else 0,
         "test_cases": test_cases_count,
         "generated_files": len(generated_code.get("written_files", [])),
         "failed_files": exec_result.get("failed_files", []),
@@ -168,41 +170,161 @@ def _make_checkpointing_node(node_name: str, node_fn, run_id: str):
 # Terminal node — write final report
 # ---------------------------------------------------------------------------
 
-def finalise_node(state: PipelineState) -> dict[str, Any]:
-    """Produce a human-readable summary report and persist it."""
-    exec_result = state.execution_result
-    debug = state.debug_analysis
-    all_passed = exec_result.get("all_passed", False)
+def _parse_test_results(raw_outputs: dict) -> list[tuple[str, str]]:
+    """Extract (test_function_name, status) pairs from pytest -v output."""
+    import re
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for out in raw_outputs.values():
+        for m in re.finditer(r"(test_\d+_\w+)\s+(PASSED|FAILED|ERROR)", out):
+            if m.group(1) not in seen:
+                seen.add(m.group(1))
+                results.append((m.group(1), m.group(2)))
+    return results
 
-    status = "PASSED" if all_passed else "FAILED"
-    if not all_passed and state.retry_count >= state.max_retries:
-        status = "FAILED (retries exhausted)"
+
+def _humanize(name: str) -> str:
+    return str(name).replace("_", " ").strip().lower()
+
+
+def _step_to_english(step: dict) -> str:
+    """Render a plan step as a plain-English reproduction step."""
+    a = str(step.get("action", "")); t = step.get("target", ""); v = step.get("value", "")
+    if a == "open_section":
+        sec = str(t).replace("SIDEBAR_", "").replace("_", " ").title()
+        return f"Open the {sec} section from the sidebar"
+    if a == "goto":
+        return f"Navigate to {t}"
+    if a == "click":
+        return f"Click the {_humanize(t)}"
+    if a == "fill":
+        return f"Type \"{v}\" into the {_humanize(t)}"
+    if a == "press":
+        return f"Press \"{v}\" on the {_humanize(t)}"
+    if a == "expect_visible":
+        return f"Check the {_humanize(t)} is visible"
+    if a == "expect_not_visible":
+        return f"Check the {_humanize(t)} is NOT visible"
+    if a == "expect_enabled":
+        return f"Check the {_humanize(t)} is enabled"
+    if a == "expect_text":
+        return f"Check the {_humanize(t)} shows text \"{v}\""
+    if a == "expect_count_gt":
+        return f"Check there are more than {v} {_humanize(t)}"
+    return f"{a} {t}".strip()
+
+
+def _failure_detail(out: str, func: str) -> tuple[str, str]:
+    """Pull the failing assertion line + the error message for `func` from the
+    pytest traceback. Returns (failing_check, error_message)."""
+    import re
+    lines = out.splitlines()
+    start = next((i for i, l in enumerate(lines) if "___" in l and func in l), None)
+    if start is None:
+        return "", ""
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if "___" in lines[j] and "test_" in lines[j]:
+            end = j
+            break
+    code_line, errs = "", []
+    for l in lines[start:end]:
+        s = l.strip()
+        if s.startswith("E "):
+            errs.append(s[1:].strip())
+        elif any(k in s for k in ("expect(", "assert ", ".click(", ".fill(", "open_section(")) \
+                and not s.startswith("E"):
+            code_line = s
+    err = " ".join(errs[:4])
+    err = re.sub(r"\s+", " ", err).strip()
+    return code_line, err[:500]
+
+
+def _expected_from_check(code_line: str) -> str:
+    """Derive the expected behaviour from the failing assertion line."""
+    import re
+    if not code_line:
+        return ""
+    m = re.search(r"locator\(([\w.]+)\)", code_line)
+    name = _humanize(m.group(1).split(".")[-1]) if m else "element"
+    if "to_be_hidden" in code_line or "not_to_be_visible" in code_line:
+        return f"The {name} should NOT be visible"
+    if "to_be_visible" in code_line:
+        return f"The {name} should be visible"
+    if "to_contain_text" in code_line:
+        return f"The {name} should contain the expected text"
+    if "to_be_enabled" in code_line:
+        return f"The {name} should be enabled"
+    if ".count(" in code_line:
+        return f"There should be more {name}"
+    return ""
+
+
+def finalise_node(state: PipelineState) -> dict[str, Any]:
+    """Summarise findings (failing checks), write a report, file Trello cards."""
+    import re
+
+    exec_result = state.execution_result
+    all_passed = exec_result.get("all_passed", False)
+    feature_name = state.requirement_analysis.get("feature_name", "unknown")
+    plan_tests = (state.test_plan or {}).get("tests", [])
+
+    raw_text = "\n".join(exec_result.get("raw_outputs", {}).values())
+    results = _parse_test_results(exec_result.get("raw_outputs", {}))
+    passed = [n for n, s in results if s == "PASSED"]
+    failed = [n for n, s in results if s in ("FAILED", "ERROR")]
+
+    # Map each failing test function (test_<NNN>_...) back to its plan, build a
+    # concrete, reproducible finding with the exact failing check + error.
+    findings: list[dict[str, Any]] = []
+    for name in failed:
+        m = re.match(r"test_0*(\d+)_", name)
+        idx = (int(m.group(1)) - 1) if m else -1
+        plan_test = plan_tests[idx] if 0 <= idx < len(plan_tests) else {}
+        title = plan_test.get("title") or name
+
+        steps = [_step_to_english(s) for s in plan_test.get("steps", [])]
+        failing_check, error_msg = _failure_detail(raw_text, name)
+
+        # Expected behaviour, derived from the ACTUAL failing assertion so it
+        # matches the evidence (falls back to the last check step).
+        expected = _expected_from_check(failing_check)
+        if not expected:
+            check_steps = [s for s in steps if s.startswith("Check")]
+            expected = check_steps[-1] if check_steps else "The verified condition holds on the live app."
+
+        findings.append({
+            "title": f"[{feature_name}] {title}",
+            "severity": "medium",
+            "steps_to_reproduce": steps or ["(see test plan)"],
+            "expected": expected,
+            "actual": error_msg or "The check failed against the live app.",
+            "evidence": failing_check or f"pytest: {name} FAILED",
+            "test": name,
+        })
+
+    status = "PASSED" if all_passed else f"FINDINGS: {len(failed)} failing check(s)"
 
     report_lines = [
-        f"# Test Pipeline Report",
+        "# Test Pipeline Report",
         f"**Generated:** {datetime.now(timezone.utc).isoformat()}",
-        f"**Feature:** {state.requirement_analysis.get('feature_name', 'unknown')}",
+        f"**Feature:** {feature_name}",
         f"**Status:** {status}",
-        f"**Retries used:** {state.retry_count} / {state.max_retries}",
         "",
         "## Execution Summary",
-        f"- Total test files: {exec_result.get('total_files', 0)}",
-        f"- Failed files: {exec_result.get('failed_files', [])}",
+        f"- Tests run: {len(results)}",
+        f"- Passed: {len(passed)}",
+        f"- Failing checks (findings): {len(failed)}",
         "",
     ]
 
-    bug_reports = debug.get("bug_reports", [])
-    feature_name = state.requirement_analysis.get("feature_name", "unknown")
-    if bug_reports:
-        report_lines.append("## Real Bugs Found")
-        for br in bug_reports:
-            report_lines.append(f"### {br.get('title', 'Untitled')}")
-            report_lines.append(f"**Severity:** {br.get('severity', 'unknown')}")
-            report_lines.append(f"**Expected:** {br.get('expected', '')}")
-            report_lines.append(f"**Actual:** {br.get('actual', '')}")
-            report_lines.append("")
+    if findings:
+        report_lines.append("## Findings (failing checks → potential bugs)")
+        for f in findings:
+            report_lines.append(f"- **{f['title']}**  _(test: {f['test']})_")
+        report_lines.append("")
 
-    trello_cards = push_bugs_to_trello(bug_reports, feature_name=feature_name)
+    trello_cards = push_bugs_to_trello(findings, feature_name=feature_name)
     if trello_cards:
         report_lines.append("## Trello Cards Created")
         for card in trello_cards:
@@ -210,19 +332,17 @@ def finalise_node(state: PipelineState) -> dict[str, Any]:
         report_lines.append("")
 
     if state.error_log:
-        report_lines.append("## Pipeline Errors")
+        report_lines.append("## Pipeline Notes")
         for err in state.error_log:
             report_lines.append(f"- {err}")
-
-    report_text = "\n".join(report_lines)
 
     reports_dir = paths.generated_reports
     reports_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    report_path = reports_dir / f"report_{ts}.md"
-    report_path.write_text(report_text)
+    (reports_dir / f"report_{ts}.md").write_text("\n".join(report_lines))
 
     return {
+        "debug_analysis": {"bug_reports": findings},
         "pipeline_status": "passed" if all_passed else "failed",
     }
 
@@ -237,7 +357,6 @@ def build_graph(run_id: str, entry_point: str = "requirement_and_design") -> Sta
         "requirement_and_design": _make_checkpointing_node("requirement_and_design", requirement_and_design_node, run_id),
         "code_generator": _make_checkpointing_node("code_generator", code_generator_node, run_id),
         "execution": _make_checkpointing_node("execution", execution_node, run_id),
-        "debug": _make_checkpointing_node("debug", debug_node, run_id),
         "finalise": _make_checkpointing_node("finalise", finalise_node, run_id),
     }
 
@@ -252,17 +371,12 @@ def build_graph(run_id: str, entry_point: str = "requirement_and_design") -> Sta
     linear_edges = [
         ("requirement_and_design", "code_generator"),
         ("code_generator", "execution"),
+        ("execution", "finalise"),
     ]
     for src, dst in linear_edges:
         if NODE_ORDER.index(src) >= entry_idx:
             graph.add_edge(src, dst)
 
-    graph.add_conditional_edges(
-        "execution",
-        should_retry,
-        {"debug": "debug", "done": "finalise"},
-    )
-    graph.add_edge("debug", "execution")
     graph.add_edge("finalise", END)
 
     return graph.compile()
