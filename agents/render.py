@@ -59,6 +59,14 @@ def _feature_locator_files(feature: str, requirement: str) -> list[Path]:
         for f in sorted(base.rglob("*.py")):
             if any(p in _SKIP_DIRS for p in f.parts):
                 continue
+            # Only use admin-portal locators — member-portal locators have
+            # different UI elements and cause wrong assertions on the admin app.
+            if "member" in f.parts:
+                continue
+            # Skip ledger-specific locator files unless the requirement explicitly
+            # mentions ledger — they add confusing sub-flow locators to the catalog.
+            if "ledger" in f.name.lower() and "ledger" not in requirement.lower():
+                continue
             name = f.name.lower()
             if "locator" not in name or f.name in seen:
                 continue
@@ -77,6 +85,7 @@ def extract_locator_catalog(feature: str, requirement: str) -> dict[str, dict]:
         {ClassName: {"module": <stem>, "selectors": {ATTR: selector}}}
 
     AST only (no import/exec), so a malformed file can never crash us.
+    Returns empty dict if no locator files match — the caller must handle this.
     """
     catalog: dict[str, dict] = {}
     for f in _feature_locator_files(feature, requirement):

@@ -45,6 +45,12 @@ def _fallback_plan(requirement: str, catalog: dict[str, dict]) -> dict[str, Any]
 def requirement_and_design_node(state: PipelineState) -> dict[str, Any]:
     """Produce a structured test plan from the requirement (single LLM call)."""
     catalog = extract_locator_catalog("", state.raw_requirement)
+    if not catalog:
+        raise RuntimeError(
+            "No locator files found for this requirement.\n"
+            "Add a locator file to your EXTERNAL_CONTEXT_DIRS whose name matches "
+            "the feature (e.g. 'fundraising_locators.py' for a fundraising requirement)."
+        )
     catalog_str = format_locator_catalog(catalog)
 
     llm = get_llm()
@@ -73,8 +79,12 @@ def requirement_and_design_node(state: PipelineState) -> dict[str, Any]:
             err = f"Planner JSON parse error (after retry): {exc}"
 
     if not isinstance(plan, dict) or not plan.get("tests"):
-        plan = _fallback_plan(state.raw_requirement, catalog)
-        err = err or "Planner returned no usable tests; used fallback plan."
+        msg = err or "Planner returned no usable tests."
+        raise RuntimeError(
+            f"Pipeline aborted: {msg}\n"
+            "This usually means the LLM hit a rate limit or returned invalid JSON.\n"
+            "Wait 60 seconds and try again, or delete .llm_cache/ to force a fresh call."
+        )
 
     return {
         "requirement_analysis": {

@@ -33,7 +33,10 @@ def _sanitize_generated_code(scripts_dir: Path) -> list[str]:
     import re as _re
 
     fixed: list[str] = []
-    py_files = list(scripts_dir.glob("*.py")) + list((scripts_dir / "page_objects").glob("*.py"))
+    page_objects_dir = scripts_dir / "page_objects"
+    py_files = list(scripts_dir.glob("*.py")) + (
+        list(page_objects_dir.glob("*.py")) if page_objects_dir.exists() else []
+    )
 
     # assert <cond>,  <newline>  <indented msg>   →   assert <cond>, <msg>
     assert_break = _re.compile(r"(^[ \t]*assert\b[^\n]*,)[ \t]*\n[ \t]+(?=\S)", _re.MULTILINE)
@@ -104,14 +107,14 @@ def _run_tests(scripts_dir: Path) -> dict[str, dict[str, Any]]:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=900,
+                timeout=120,
                 env=env,
                 cwd=str(scripts_dir),
             )
             output = proc.stdout + "\n" + proc.stderr
             results[test_file.name] = {"output": output[-6000:], "returncode": proc.returncode}
         except subprocess.TimeoutExpired:
-            results[test_file.name] = {"output": "TIMEOUT: Test execution exceeded 900 seconds.", "returncode": 124}
+            results[test_file.name] = {"output": "TIMEOUT: Test execution exceeded 120 seconds.", "returncode": 124}
         except Exception as exc:
             results[test_file.name] = {"output": f"EXECUTION ERROR: {exc}", "returncode": 1}
 

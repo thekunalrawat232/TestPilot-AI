@@ -31,7 +31,7 @@ console = Console()
 def _print_header() -> None:
     console.print(Panel.fit(
         "[bold cyan]AI Test Agent[/bold cyan] — Multi-Agent QA Pipeline\n"
-        "LangGraph · RAG · Playwright · Selenium",
+        "LangGraph · RAG · Playwright",
         border_style="cyan",
     ))
 

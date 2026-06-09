@@ -44,12 +44,16 @@ def code_generator_node(state: PipelineState) -> dict[str, Any]:
     _clean_scripts_dir(scripts_dir)
 
     feature = state.requirement_analysis.get("feature_name") or ""
-    catalog = extract_locator_catalog(feature, state.raw_requirement)
+    # Use empty feature name to match requirement_and_design_node's catalog call —
+    # both must use identical inputs so the LLM's locator names resolve in the renderer.
+    catalog = extract_locator_catalog("", state.raw_requirement)
 
     written: list[str] = []
     try:
         written += write_harness(scripts_dir)
-        written += write_locator_package(scripts_dir, feature, state.raw_requirement)
+        # Use "" for feature — must match the catalog call above so the same
+        # locator files are both in the catalog AND copied to disk.
+        written += write_locator_package(scripts_dir, "", state.raw_requirement)
         code = render_test_file(state.test_plan or {}, catalog)
         test_path = scripts_dir / f"test_{_slug(feature)}_pw.py"
         test_path.write_text(code)
