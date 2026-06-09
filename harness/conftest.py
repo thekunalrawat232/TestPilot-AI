@@ -37,17 +37,29 @@ def _auth_state(_browser):
     """Log in ONCE per session via Auth0 and persist storage_state to disk."""
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         pytest.skip("ADMIN_EMAIL and ADMIN_PASSWORD must be set for authenticated tests.")
-    ctx = _browser.new_context(ignore_https_errors=True)
+    ctx = _browser.new_context(
+        ignore_https_errors=True,
+        viewport={"width": 1280, "height": 900},
+    )
     page = ctx.new_page()
     page.set_default_timeout(DEFAULT_TIMEOUT)
     # /members triggers the Auth0 hosted-login redirect.
     page.goto(f"{BASE_URL}/members", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
     page.get_by_label(LOGIN_EMAIL_LABEL).fill(ADMIN_EMAIL)
     page.get_by_label(LOGIN_PASSWORD_LABEL).fill(ADMIN_PASSWORD)
-    page.locator(LOGIN_BUTTON).click()
+    btn = page.locator(LOGIN_BUTTON)
+    btn.scroll_into_view_if_needed(timeout=5_000)
+    btn.click()
     page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-    dismiss_frill(page)
     expect(page.locator(DASHBOARD_INDICATOR).first).to_be_visible(timeout=20_000)
+    # Wait for ALL Frill popups to initialise, then dismiss by clicking their
+    # real buttons so Frill records the dismissal in localStorage.
+    # Storage state is saved AFTER this so every subsequent context inherits
+    # the "already dismissed" flag and the popups won't reappear.
+    page.wait_for_timeout(3_000)
+    dismiss_frill(page)
+    page.wait_for_timeout(500)
+    dismiss_frill(page)  # second pass in case multiple popups queued
     ctx.storage_state(path=str(SESSION_FILE))
     ctx.close()
     return str(SESSION_FILE)
@@ -60,7 +72,11 @@ def authenticated_page(_browser, _auth_state):
     Navigating to the app start path first means the sidebar is loaded, so tests
     can navigate to a section by clicking its sidebar entry (no URL guessing).
     """
-    ctx = _browser.new_context(storage_state=_auth_state, ignore_https_errors=True)
+    ctx = _browser.new_context(
+        storage_state=_auth_state,
+        ignore_https_errors=True,
+        viewport={"width": 1280, "height": 900},
+    )
     page = ctx.new_page()
     page.set_default_timeout(DEFAULT_TIMEOUT)
     page.goto(f"{BASE_URL}{APP_START_PATH}", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)

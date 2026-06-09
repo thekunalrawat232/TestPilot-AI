@@ -27,10 +27,18 @@ NAV_TIMEOUT = 30_000
 def open_section(page, sidebar_selector: str) -> None:
     """Navigate to a section by clicking its sidebar entry (no URL guessing).
 
-    Mirrors how the real framework navigates. Assumes the app shell (sidebar) is
-    already loaded — the ``authenticated_page`` fixture ensures that.
+    The sidebar starts collapsed (div.d-none). Clicking button.menu-button
+    expands it. This checks visibility first so it only toggles when needed.
     """
-    page.locator(sidebar_selector).first.click(timeout=NAV_TIMEOUT)
+    el = page.locator(sidebar_selector).first
+    # Expand the sidebar if collapsed, then wait until the item is actually visible
+    if not el.is_visible():
+        try:
+            page.locator("button.menu-button").click(timeout=5_000)
+            el.wait_for(state="visible", timeout=8_000)
+        except Exception:
+            pass
+    el.click(timeout=NAV_TIMEOUT)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
     except Exception:
@@ -39,24 +47,50 @@ def open_section(page, sidebar_selector: str) -> None:
 
 
 def dismiss_frill(page) -> bool:
-    """Remove the intermittent Frill 'what's new' popup if it appears.
+    """Dismiss any Frill popup/survey that could obscure the sidebar.
 
-    Waits up to 3s for it; if present, strips it from the DOM. Safe no-op when
-    absent. The popup shows only sometimes, so this must always be conditional.
+    Handles two flavours:
+      1. The notification modal (DOM element) — removed via JS.
+      2. The survey widget (rendered inside an iframe) — clicked via frame_locator.
+    Safe no-op when neither is present.
     """
+    dismissed = False
+
+    # 1. Notification modal — try clicking its close button first so Frill
+    #    records the dismissal in localStorage; fall back to JS removal.
     try:
         page.locator(FRILL_MODAL).wait_for(state="visible", timeout=3000)
-    except Exception:
-        return False
-    try:
-        page.evaluate(
-            "() => { document.querySelectorAll('.Frill_Notification_Modal, .Frill_Notification')"
-            ".forEach(el => el.remove()); }"
-        )
+        try:
+            page.locator(f"{FRILL_MODAL} button[aria-label='Close'], {FRILL_MODAL} button.close").first.click(timeout=2000)
+        except Exception:
+            page.evaluate(
+                "() => { document.querySelectorAll('.Frill_Notification_Modal, .Frill_Notification')"
+                ".forEach(el => el.remove()); }"
+            )
         page.wait_for_timeout(300)
+        dismissed = True
     except Exception:
         pass
-    return True
+
+    # 2. Announcements popup (Frill sidebar iframe — aria-label="Close")
+    try:
+        ann_frame = page.frame_locator("[id^='Frill_Frame']:not([id^='Frill_Frame_survey'])")
+        ann_frame.locator("button[aria-label='Close']").click(timeout=3000)
+        page.wait_for_timeout(300)
+        dismissed = True
+    except Exception:
+        pass
+
+    # 3. Survey popup (inside iframe — id starts with "Frill_Frame_survey")
+    try:
+        survey_frame = page.frame_locator("[id^='Frill_Frame_survey']")
+        survey_frame.locator("button[aria-label='Dismiss survey']").click(timeout=3000)
+        page.wait_for_timeout(300)
+        dismissed = True
+    except Exception:
+        pass
+
+    return dismissed
 
 
 def app_goto(page, path: str = "/") -> None:

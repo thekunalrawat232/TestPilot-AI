@@ -214,6 +214,31 @@ def _step_to_english(step: dict) -> str:
     return f"{a} {t}".strip()
 
 
+_INFRA_SIGNALS = (
+    "TimeoutError",
+    "TimeoutException",
+    "timeout exceeded",
+    "Timeout ",
+)
+
+
+def _is_infra_failure(failing_check: str, error_msg: str) -> bool:
+    """Return True when the test crashed navigating/clicking before it reached any
+    real assertion. These are test-infrastructure failures (element not found /
+    sidebar not ready), NOT app bugs — they must not generate Trello cards."""
+    if any(sig in error_msg for sig in _INFRA_SIGNALS):
+        return True
+    # Failing line was a navigation/click action, not an expect() assertion
+    if failing_check:
+        nav_only = ("open_section(", "page.goto(", ".fill(")
+        is_assert = ("expect(", "assert ", "to_be_visible", "to_contain_text",
+                     "to_be_hidden", "to_be_enabled", "count(")
+        if any(n in failing_check for n in nav_only) and \
+                not any(a in failing_check for a in is_assert):
+            return True
+    return False
+
+
 def _failure_detail(out: str, func: str) -> tuple[str, str]:
     """Pull the failing assertion line + the error message for `func` from the
     pytest traceback. Returns (failing_check, error_message)."""
@@ -285,6 +310,11 @@ def finalise_node(state: PipelineState) -> dict[str, Any]:
 
         steps = [_step_to_english(s) for s in plan_test.get("steps", [])]
         failing_check, error_msg = _failure_detail(raw_text, name)
+
+        # Skip infrastructure failures — couldn't navigate/click before even
+        # reaching an assertion. These are not app bugs.
+        if _is_infra_failure(failing_check, error_msg):
+            continue
 
         # Expected behaviour, derived from the ACTUAL failing assertion so it
         # matches the evidence (falls back to the last check step).
